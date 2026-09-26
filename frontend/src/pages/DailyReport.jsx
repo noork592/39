@@ -386,13 +386,13 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
                 </button>
               </div>
             </div>
-            <div className="flex items-center gap-2 mt-1">
+            <div className="flex items-center gap-2 mt-1 flex-wrap">
               <Popover open={datePopoverOpen} onOpenChange={setDatePopoverOpen}>
                 <PopoverTrigger asChild>
                   <Button
                     variant="outline"
                     data-testid="report-date-input"
-                    className="h-10 rounded-sm border-slate-300 bg-white font-mono-num text-slate-900 pl-9 pr-3 justify-start relative min-w-[150px] ml-4"
+                    className="h-10 rounded-sm border-slate-300 bg-white font-mono-num text-slate-900 pl-9 pr-3 justify-start relative min-w-[150px]"
                   >
                     <Calendar className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
                     {date}
@@ -469,16 +469,16 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
                   </Popover>
                 </>
               )}
+              <Button
+                onClick={doPrint}
+                variant="outline"
+                data-testid="report-print-btn"
+                className="rounded-sm border-slate-300 h-10"
+              >
+                <Printer className="w-4 h-4 mr-1.5" /> Print / Save PDF
+              </Button>
             </div>
           </div>
-          <Button
-            onClick={doPrint}
-            variant="outline"
-            data-testid="report-print-btn"
-            className="rounded-sm border-slate-300 h-10"
-          >
-            <Printer className="w-4 h-4 mr-1.5" /> Print / Save PDF
-          </Button>
         </div>
       </div>
 
