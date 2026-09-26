@@ -4121,9 +4121,11 @@ async def import_price_list(plid: str, file: UploadFile = File(...), admin=Depen
 
 # ======================== Daily Dispatch Report ========================
 @api_router.get("/reports/daily-dispatch")
-async def daily_dispatch_report(date: Optional[str] = None, user=Depends(get_current_user)):
+async def daily_dispatch_report(date: Optional[str] = None, end_date: Optional[str] = None, user=Depends(get_current_user)):
     """Consolidated end-of-day report grouped by party (customer).
-    `date` is YYYY-MM-DD; defaults to today's IST date.
+    `date` is YYYY-MM-DD; defaults to today's IST date. When `end_date`
+    (YYYY-MM-DD, on/after `date`) is supplied, the report spans the full
+    date RANGE (inclusive, IST day boundaries) instead of a single day.
 
     Day boundaries use India Standard Time (UTC+5:30) so the report's
     grouping matches the factory's actual working day — same convention
@@ -4140,6 +4142,16 @@ async def daily_dispatch_report(date: Optional[str] = None, user=Depends(get_cur
             raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
     else:
         target = today_ist
+    # Optional range end — inclusive, validated against the start date.
+    if end_date:
+        try:
+            end_target = datetime.strptime(end_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="end_date must be YYYY-MM-DD")
+        if end_target < target:
+            raise HTTPException(status_code=400, detail="end_date must be on or after date")
+    else:
+        end_target = target
     # Edit-window metadata so the UI can lock/unlock the edit controls.
     settings = await _get_settings_doc()
     edit_window_days = int(settings.get("edit_window_days", 3) or 0)
@@ -4147,6 +4159,7 @@ async def daily_dispatch_report(date: Optional[str] = None, user=Depends(get_cur
     if is_blank_view(user):
         return {
             "date": target.isoformat(),
+            "end_date": end_target.isoformat(),
             "groups": [],
             "grand_total_pcs": 0,
             "grand_total_value": 0,
@@ -4172,9 +4185,10 @@ async def daily_dispatch_report(date: Optional[str] = None, user=Depends(get_cur
         except Exception:
             return False
     # IST day window expressed in UTC for the ISO-string compare against
-    # `dispatched_at` (which is stored in UTC).
+    # `dispatched_at` (which is stored in UTC). Range mode: the window runs
+    # from the START of the first day to the END of the last day (IST).
     start = datetime.combine(target, datetime.min.time(), tzinfo=IST).astimezone(timezone.utc).isoformat()
-    end = datetime.combine(target, datetime.max.time(), tzinfo=IST).astimezone(timezone.utc).isoformat()
+    end = datetime.combine(end_target, datetime.max.time(), tzinfo=IST).astimezone(timezone.utc).isoformat()
     dispatches = await db.dispatches.find(
         {"dispatched_at": {"$gte": start, "$lte": end}},
         {"_id": 0},
@@ -4346,6 +4360,7 @@ async def daily_dispatch_report(date: Optional[str] = None, user=Depends(get_cur
     out_groups = sorted(groups.values(), key=lambda g: g["customer_name"].lower())
     return {
         "date": target.isoformat(),
+        "end_date": end_target.isoformat(),
         "groups": out_groups,
         "grand_total_pcs": grand_pcs,
         "grand_total_value": round(grand_value, 2),
