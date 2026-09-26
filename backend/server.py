@@ -1088,6 +1088,18 @@ class NotificationMarkReadIn(BaseModel):
     all: bool = False                 # mark everything read
 
 
+class NotificationClearIn(BaseModel):
+    """Dismiss (hide) notifications. Cleared docs stay in the DB with their
+    dedupe_key, so the daily recomputation will NOT resurrect them the same
+    day — a fresh alert only reappears on the next IST day if the condition
+    still holds."""
+    ids: Optional[List[str]] = None
+    all: bool = False
+
+
+_ACTIVE_FILTER = {"cleared": {"$ne": True}}
+
+
 async def _compute_and_store_notifications(user: Dict[str, Any]) -> None:
     """Compute today's alerts and upsert them into the notifications
     collection (idempotent per IST day via dedupe_key)."""
@@ -1216,8 +1228,8 @@ async def list_notifications(limit: int = 100, user=Depends(get_current_user)):
     await _compute_and_store_notifications(user)
     if limit <= 0 or limit > 500:
         limit = 100
-    items = await db.notifications.find({}, {"_id": 0}).sort("created_at", -1).to_list(limit)
-    unread = await db.notifications.count_documents({"read": False})
+    items = await db.notifications.find(_ACTIVE_FILTER, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    unread = await db.notifications.count_documents({"read": False, **_ACTIVE_FILTER})
     return {"unread_count": unread, "items": items}
 
 
@@ -1227,7 +1239,7 @@ async def notifications_unread_count(user=Depends(get_current_user)):
     if is_blank_view(user):
         return {"unread_count": 0}
     await _compute_and_store_notifications(user)
-    unread = await db.notifications.count_documents({"read": False})
+    unread = await db.notifications.count_documents({"read": False, **_ACTIVE_FILTER})
     return {"unread_count": unread}
 
 
@@ -1236,7 +1248,7 @@ async def notifications_mark_read(body: NotificationMarkReadIn, user=Depends(get
     ts = now_iso()
     if body.all:
         res = await db.notifications.update_many(
-            {"read": False}, {"$set": {"read": True, "read_at": ts}}
+            {"read": False, **_ACTIVE_FILTER}, {"$set": {"read": True, "read_at": ts}}
         )
     elif body.ids:
         res = await db.notifications.update_many(
@@ -1244,7 +1256,24 @@ async def notifications_mark_read(body: NotificationMarkReadIn, user=Depends(get
         )
     else:
         raise HTTPException(status_code=400, detail="Provide `ids` or set `all` true")
-    unread = await db.notifications.count_documents({"read": False})
+    unread = await db.notifications.count_documents({"read": False, **_ACTIVE_FILTER})
+    return {"ok": True, "modified": res.modified_count, "unread_count": unread}
+
+
+@api_router.post("/notifications/clear")
+async def notifications_clear(body: NotificationClearIn, user=Depends(get_current_user)):
+    """Dismiss one or more notifications. Cleared alerts are hidden from the
+    feed and badge but kept in the DB (history) — and because the dedupe_key
+    still exists, today's recomputation won't bring them back."""
+    ts = now_iso()
+    patch = {"cleared": True, "read": True, "read_at": ts, "cleared_at": ts}
+    if body.all:
+        res = await db.notifications.update_many(_ACTIVE_FILTER, {"$set": patch})
+    elif body.ids:
+        res = await db.notifications.update_many({"id": {"$in": body.ids}}, {"$set": patch})
+    else:
+        raise HTTPException(status_code=400, detail="Provide `ids` or set `all` true")
+    unread = await db.notifications.count_documents({"read": False, **_ACTIVE_FILTER})
     return {"ok": True, "modified": res.modified_count, "unread_count": unread}
 
 

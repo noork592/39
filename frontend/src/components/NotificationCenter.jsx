@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Bell, X, PackageCheck, AlertTriangle, CheckCheck, Inbox } from "lucide-react";
+import { Bell, X, PackageCheck, AlertTriangle, CheckCheck, Inbox, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 
@@ -135,6 +135,26 @@ export default function NotificationCenter() {
     }
   };
 
+  const clearOne = async (n) => {
+    try {
+      const { data } = await api.post("/notifications/clear", { ids: [n.id] });
+      setUnread(Number(data?.unread_count || 0));
+      setItems((prev) => prev.filter((x) => x.id !== n.id));
+    } catch {
+      /* silent */
+    }
+  };
+
+  const clearAll = async () => {
+    try {
+      const { data } = await api.post("/notifications/clear", { all: true });
+      setUnread(Number(data?.unread_count || 0));
+      setItems([]);
+    } catch {
+      /* silent */
+    }
+  };
+
   return (
     <>
       {/* Bell button */}
@@ -193,6 +213,16 @@ export default function NotificationCenter() {
               >
                 <CheckCheck className="w-4 h-4 mr-1.5" /> Mark all read
               </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={clearAll}
+                disabled={items.length === 0}
+                data-testid="notif-clear-all"
+                className="rounded-sm h-9 text-slate-600 hover:text-rose-700"
+              >
+                <Trash2 className="w-4 h-4 mr-1.5" /> Clear all
+              </Button>
               <button
                 type="button"
                 onClick={() => setOpen(false)}
@@ -239,6 +269,18 @@ export default function NotificationCenter() {
                       <div className="text-xs text-slate-600 mt-0.5 break-words">{n.message}</div>
                       <div className="text-[10px] text-slate-400 mt-1 font-mono-num">{timeAgo(n.created_at)}</div>
                     </div>
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      aria-label="Clear notification"
+                      title="Clear this notification"
+                      onClick={(e) => { e.stopPropagation(); clearOne(n); }}
+                      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); clearOne(n); } }}
+                      data-testid={`notif-clear-${n.id}`}
+                      className="shrink-0 p-1.5 rounded-sm text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors"
+                    >
+                      <X className="w-4 h-4" />
+                    </span>
                   </button>
                 );
               })}
