@@ -359,6 +359,7 @@ ALL_GRANTABLE_KEYS: List[str] = ALL_PERMISSION_KEYS + ACTION_PERMISSION_KEYS
 class SettingsUpdate(BaseModel):
     overdue_days: Optional[int] = None
     edit_window_days: Optional[int] = None
+    discrepancy_window_days: Optional[int] = None
 
 
 class ItemCreate(BaseModel):
@@ -673,13 +674,18 @@ async def seed_db():
         logger.info("Bill-number migration: converted %s numeric private marks", _num_migrated.modified_count)
     # Settings singleton — overdue order threshold (admin-configurable)
     if await db.settings.count_documents({"id": "global"}) == 0:
-        await db.settings.insert_one({"id": "global", "overdue_days": 15, "edit_window_days": 3, "updated_at": now_iso()})
+        await db.settings.insert_one({"id": "global", "overdue_days": 15, "edit_window_days": 3, "discrepancy_window_days": 2, "updated_at": now_iso()})
         logger.info("Seeded default settings (overdue_days=15, edit_window_days=3)")
     else:
         # Back-fill the new edit_window_days field on existing installs
         await db.settings.update_one(
             {"id": "global", "edit_window_days": {"$exists": False}},
             {"$set": {"edit_window_days": 3}},
+        )
+        # Back-fill the discrepancy detection window on existing installs
+        await db.settings.update_one(
+            {"id": "global", "discrepancy_window_days": {"$exists": False}},
+            {"$set": {"discrepancy_window_days": 2}},
         )
     # Products — additive: insert any from DEFAULT_PRODUCTS that don't exist yet
     existing_names = {p["name"] for p in await db.products.find({}, {"_id": 0, "name": 1}).to_list(1000)}
@@ -1014,11 +1020,13 @@ async def permission_audit_all(limit: int = 100, admin=Depends(require_admin)):
 async def _get_settings_doc() -> Dict[str, Any]:
     doc = await db.settings.find_one({"id": "global"}, {"_id": 0})
     if not doc:
-        doc = {"id": "global", "overdue_days": 15, "edit_window_days": 3}
+        doc = {"id": "global", "overdue_days": 15, "edit_window_days": 3, "discrepancy_window_days": 2}
         await db.settings.insert_one({**doc, "updated_at": now_iso()})
     # Back-fill defaults for older docs.
     if "edit_window_days" not in doc:
         doc["edit_window_days"] = 3
+    if "discrepancy_window_days" not in doc:
+        doc["discrepancy_window_days"] = 2
     return doc
 
 
@@ -1039,6 +1047,13 @@ async def update_settings(body: SettingsUpdate, admin=Depends(require_admin)):
         if body.edit_window_days < 0 or body.edit_window_days > 365:
             raise HTTPException(status_code=400, detail="edit_window_days must be between 0 and 365")
         upd["edit_window_days"] = int(body.edit_window_days)
+    if body.discrepancy_window_days is not None:
+        # How many days BEFORE an order was entered a dispatch may fall and
+        # still be flagged as a timing discrepancy. Older dispatches are
+        # ignored. 0 = only same-day dispatches are flagged.
+        if body.discrepancy_window_days < 0 or body.discrepancy_window_days > 365:
+            raise HTTPException(status_code=400, detail="discrepancy_window_days must be between 0 and 365")
+        upd["discrepancy_window_days"] = int(body.discrepancy_window_days)
     if len(upd) == 1:
         # Only updated_at present — nothing to update.
         return await _get_settings_doc()
@@ -1779,6 +1794,9 @@ async def list_orders(status_filter: Optional[str] = None, user=Depends(get_curr
     # Annotate overdue flag + days_open for Pending orders, using admin-set threshold
     settings = await _get_settings_doc()
     threshold = int(settings.get("overdue_days", 15))
+    # Timing-discrepancy look-back window (admin-configurable): only flag a
+    # dispatch that happened at most this many days BEFORE the order entry.
+    disc_window = int(settings.get("discrepancy_window_days", 2))
     now = datetime.now(timezone.utc)
 
     # Customer location cache — the dispatch UI shows the party's city /
@@ -1968,6 +1986,11 @@ async def list_orders(status_filter: Optional[str] = None, user=Depends(get_curr
                     continue
                 # Core signal: goods shipped BEFORE this order was entered.
                 if not (disp_dt < entered):
+                    continue
+                # Days limit: only flag when the dispatch falls within the
+                # admin-configured window before the order entry. Dispatches
+                # older than that are treated as unrelated history.
+                if (entered - disp_dt) > timedelta(days=disc_window):
                     continue
                 # Require at least one shared SKU.
                 matched = []
