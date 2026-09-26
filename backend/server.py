@@ -1067,8 +1067,10 @@ async def update_settings(body: SettingsUpdate, admin=Depends(require_admin)):
 
 # ======================== Notifications ========================
 # Live-computed alert feed with a persistent history. Two alert families:
-#   1) "pending_dispatch" — an order is punched and still Pending (goods
-#      ordered but not dispatched). Re-raised DAILY until the order clears.
+#   1) "pending_dispatch" — an order is punched, still Pending, AND at
+#      least one of its items is in stock (every raw material in the item's
+#      BOM covers the ordered qty — stock is fed in the Raw Materials tab).
+#      Re-raised DAILY until the order clears.
 #   2) "low_stock" — a raw material / vendor item whose stock_on_hand has
 #      fallen below its admin-set min_stock. Re-raised DAILY while low.
 # Each computed alert is upserted into the `notifications` collection with a
@@ -1104,12 +1106,56 @@ async def _compute_and_store_notifications(user: Dict[str, Any]) -> None:
         async for c in db.customers.find({"id": {"$in": cust_ids}}, {"_id": 0, "id": 1, "name": 1}):
             cust_names[c["id"]] = c.get("name", "")
 
+    # Stock is fed in the Raw Materials tab. An order line counts as
+    # "in stock" only when every raw material in that SKU's BOM has enough
+    # stock_on_hand to cover the ordered qty. SKUs without a BOM (or with
+    # insufficient stock) are treated as NOT fed → no notification.
+    all_item_ids = list({
+        it.get("item_id")
+        for o in pending for it in (o.get("items") or [])
+        if it.get("item_id")
+    })
+    item_docs: Dict[str, Dict[str, Any]] = {}
+    if all_item_ids:
+        async for it in db.items.find(
+            {"id": {"$in": all_item_ids}}, {"_id": 0, "id": 1, "name": 1, "bom": 1}
+        ):
+            item_docs[it["id"]] = it
+    rm_stock: Dict[str, float] = {}
+    async for rm in db.raw_materials.find({}, {"_id": 0, "id": 1, "stock_on_hand": 1}):
+        rm_stock[rm["id"]] = float(rm.get("stock_on_hand") or 0)
+
     to_upsert: List[Dict[str, Any]] = []
     for o in pending:
-        item_count = len(o.get("items") or [])
-        if item_count == 0:
+        lines = o.get("items") or []
+        if not lines:
+            continue
+        ready: List[str] = []
+        for it in lines:
+            doc = item_docs.get(it.get("item_id"))
+            bom = (doc or {}).get("bom") or []
+            if not bom:
+                continue  # stock never fed / no recipe → skip
+            try:
+                qty = int(float(str(it.get("quantity") or 0).replace(",", "").strip() or 0))
+            except (TypeError, ValueError):
+                qty = 0
+            if qty <= 0:
+                continue
+            can_make = True
+            for comp in bom:
+                need = float(comp.get("qty_per_unit") or 0) * qty
+                if need > 0 and rm_stock.get(comp.get("raw_material_id"), 0.0) < need:
+                    can_make = False
+                    break
+            if can_make:
+                name = it.get("item_name") or (doc or {}).get("name") or "Item"
+                ready.append(f"{name} ×{qty}")
+        # Notify only when at least one ordered item is in stock.
+        if not ready:
             continue
         party = cust_names.get(o.get("customer_id") or "", "Unknown party")
+        shown = ", ".join(ready[:3]) + (f" +{len(ready) - 3} more" if len(ready) > 3 else "")
         dedupe = f"pending_dispatch:{o['id']}:{bucket}"
         to_upsert.append({
             "dedupe_key": dedupe,
@@ -1117,7 +1163,7 @@ async def _compute_and_store_notifications(user: Dict[str, Any]) -> None:
             "severity": "warning",
             "entity_id": o["id"],
             "title": f"Ready to dispatch — {party}",
-            "message": f"{item_count} item(s) ordered and awaiting dispatch. Reminder repeats daily until dispatched.",
+            "message": f"In stock: {shown}. Reminder repeats daily until dispatched.",
             "date_bucket": bucket,
         })
 
