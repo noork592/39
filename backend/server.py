@@ -8009,75 +8009,158 @@ async def transport_geocode(body: GeocodeIn, _user=Depends(get_current_user)):
 
 @api_router.post("/transport/optimize")
 async def transport_optimize(body: OptimizeIn, _user=Depends(get_current_user)):
-    """Compute a good factory→stops route using the free OSRM public server.
-    Uses the /trip endpoint (roundtrip=false, source=first) — a TSP-ish
-    solver over real road distances. Falls back to a nearest-neighbour
-    haversine ordering if OSRM is unreachable so the UI keeps working.
+    """Compute MULTIPLE candidate factory→stops routes so the operator can
+    choose. Returns an `options` list (each with its own order / distance /
+    duration / geometry) plus the best one flattened at the top level for
+    backwards compatibility.
+
+    Candidates generated:
+      1. "Shortest (optimized)" — OSRM /trip TSP solver over real roads.
+      2. "Nearest first"        — greedy nearest-neighbour (haversine) order,
+                                   drawn on real roads via OSRM /route.
+      3. "As selected"          — the exact order the operator picked, drawn
+                                   on real roads via OSRM /route.
+    Identical orderings are de-duplicated. If OSRM is unreachable we fall
+    back to straight-line geometry so the UI still works.
     """
     stops = body.stops or []
     if not stops:
         raise HTTPException(status_code=400, detail="At least one stop is required")
-    factory = f"{FACTORY_LOCATION['lng']},{FACTORY_LOCATION['lat']}"
-    coord_list = [factory] + [f"{s.lng},{s.lat}" for s in stops]
-    coords = ";".join(coord_list)
-    url = f"https://router.project-osrm.org/trip/v1/driving/{coords}"
-    params = {"source": "first", "roundtrip": "false", "overview": "full", "geometries": "polyline"}
-    import httpx as _httpx
-    try:
-        async with _httpx.AsyncClient(timeout=20) as c:
-            r = await c.get(url, params=params)
-            r.raise_for_status()
-            data = r.json()
-        if data.get("code") != "Ok" or not data.get("trips"):
-            raise RuntimeError(data.get("message") or "OSRM did not return a trip")
-        trip = data["trips"][0]
-        # waypoints[i].waypoint_index gives the visit order for input i
-        wps = data.get("waypoints") or []
-        # Skip index 0 which is the factory; return 0-based indices into `stops`.
-        order = [0] * (len(coord_list) - 1)
-        for i, wp in enumerate(wps):
-            if i == 0:
-                continue  # factory
-            visit_pos = int(wp.get("waypoint_index", i))  # 0..N
-            # visit_pos==0 means the factory; stop's actual visit rank is visit_pos
-            order[visit_pos - 1] = i - 1
-        return {
-            "ok": True,
-            "engine": "osrm",
-            "order": order,
-            "total_distance_km": round((trip.get("distance") or 0) / 1000.0, 2),
-            "total_duration_min": round((trip.get("duration") or 0) / 60.0, 1),
-            "geometry": trip.get("geometry", ""),
-        }
-    except Exception as e:
-        logger.warning("OSRM trip failed, using haversine fallback: %s", e)
 
-    # ── Fallback: nearest-neighbour over straight-line (haversine) distance ──
+    import httpx as _httpx
     from math import radians, sin, cos, asin, sqrt
+
+    factory_ll = (FACTORY_LOCATION["lat"], FACTORY_LOCATION["lng"])
+    pts = [(s.lat, s.lng) for s in stops]
+
     def hav(a, b):
         lat1, lon1 = radians(a[0]), radians(a[1])
         lat2, lon2 = radians(b[0]), radians(b[1])
         dlat, dlon = lat2 - lat1, lon2 - lon1
         h = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
         return 2 * 6371.0 * asin(sqrt(h))
-    pts = [(s.lat, s.lng) for s in stops]
+
+    def _coords_for_order(order: List[int]) -> str:
+        parts = [f"{FACTORY_LOCATION['lng']},{FACTORY_LOCATION['lat']}"]
+        parts += [f"{stops[i].lng},{stops[i].lat}" for i in order]
+        return ";".join(parts)
+
+    async def _osrm_route(client, order: List[int]):
+        """Real-road distance/duration/geometry for a FIXED visit order."""
+        url = f"https://router.project-osrm.org/route/v1/driving/{_coords_for_order(order)}"
+        params = {"overview": "full", "geometries": "polyline"}
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("code") != "Ok" or not data.get("routes"):
+            raise RuntimeError(data.get("message") or "OSRM route failed")
+        rt = data["routes"][0]
+        return {
+            "total_distance_km": round((rt.get("distance") or 0) / 1000.0, 2),
+            "total_duration_min": round((rt.get("duration") or 0) / 60.0, 1),
+            "geometry": rt.get("geometry", ""),
+        }
+
+    def _hav_total(order: List[int]) -> float:
+        cur = factory_ll
+        tot = 0.0
+        for i in order:
+            tot += hav(cur, pts[i])
+            cur = pts[i]
+        return round(tot, 2)
+
+    # ── Build the candidate ORDERS ───────────────────────────────────────
+    selected_order = list(range(len(stops)))
+    # Nearest-neighbour greedy order
     remaining = list(range(len(pts)))
-    order: List[int] = []
-    cur = (FACTORY_LOCATION["lat"], FACTORY_LOCATION["lng"])
-    total = 0.0
+    nn_order: List[int] = []
+    cur = factory_ll
     while remaining:
         nxt = min(remaining, key=lambda i: hav(cur, pts[i]))
-        total += hav(cur, pts[nxt])
-        order.append(nxt)
+        nn_order.append(nxt)
         cur = pts[nxt]
         remaining.remove(nxt)
+
+    options: List[Dict[str, Any]] = []
+    seen_orders = set()
+
+    def _add_option(label, engine, order, metrics):
+        key = tuple(order)
+        if key in seen_orders:
+            return
+        seen_orders.add(key)
+        options.append({
+            "label": label,
+            "engine": engine,
+            "order": order,
+            "total_distance_km": metrics.get("total_distance_km"),
+            "total_duration_min": metrics.get("total_duration_min"),
+            "geometry": metrics.get("geometry", ""),
+        })
+
+    try:
+        async with _httpx.AsyncClient(timeout=20) as c:
+            # 1) OSRM /trip optimized order
+            trip_order = None
+            try:
+                url = f"https://router.project-osrm.org/trip/v1/driving/{_coords_for_order(selected_order)}"
+                params = {"source": "first", "roundtrip": "false", "overview": "full", "geometries": "polyline"}
+                r = await c.get(url, params=params)
+                r.raise_for_status()
+                data = r.json()
+                if data.get("code") == "Ok" and data.get("trips"):
+                    trip = data["trips"][0]
+                    wps = data.get("waypoints") or []
+                    trip_order = [0] * len(stops)
+                    for i, wp in enumerate(wps):
+                        if i == 0:
+                            continue
+                        visit_pos = int(wp.get("waypoint_index", i))
+                        trip_order[visit_pos - 1] = i - 1
+                    _add_option("Shortest (optimized)", "osrm", trip_order, {
+                        "total_distance_km": round((trip.get("distance") or 0) / 1000.0, 2),
+                        "total_duration_min": round((trip.get("duration") or 0) / 60.0, 1),
+                        "geometry": trip.get("geometry", ""),
+                    })
+            except Exception as e:
+                logger.warning("OSRM trip failed: %s", e)
+
+            # 2) Nearest-first (real roads)
+            try:
+                _add_option("Nearest first", "osrm", nn_order, await _osrm_route(c, nn_order))
+            except Exception as e:
+                logger.warning("OSRM nearest-first route failed: %s", e)
+                _add_option("Nearest first", "haversine", nn_order,
+                            {"total_distance_km": _hav_total(nn_order), "total_duration_min": None, "geometry": ""})
+
+            # 3) As-selected order (real roads)
+            try:
+                _add_option("As selected", "osrm", selected_order, await _osrm_route(c, selected_order))
+            except Exception as e:
+                logger.warning("OSRM as-selected route failed: %s", e)
+                _add_option("As selected", "haversine", selected_order,
+                            {"total_distance_km": _hav_total(selected_order), "total_duration_min": None, "geometry": ""})
+    except Exception as e:
+        logger.warning("OSRM unreachable, using haversine fallbacks: %s", e)
+
+    # Guaranteed fallbacks if OSRM produced nothing at all.
+    if not options:
+        _add_option("Nearest first", "haversine", nn_order,
+                    {"total_distance_km": _hav_total(nn_order), "total_duration_min": None, "geometry": ""})
+        _add_option("As selected", "haversine", selected_order,
+                    {"total_distance_km": _hav_total(selected_order), "total_duration_min": None, "geometry": ""})
+
+    # Sort options shortest-first so the best is on top / default.
+    options.sort(key=lambda o: (o.get("total_distance_km") is None, o.get("total_distance_km") or 1e9))
+    best = options[0]
     return {
         "ok": True,
-        "engine": "haversine",
-        "order": order,
-        "total_distance_km": round(total, 2),
-        "total_duration_min": None,
-        "geometry": "",
+        "engine": best["engine"],
+        "order": best["order"],
+        "total_distance_km": best["total_distance_km"],
+        "total_duration_min": best["total_duration_min"],
+        "geometry": best["geometry"],
+        "options": options,
     }
 
 
