@@ -1065,6 +1065,144 @@ async def update_settings(body: SettingsUpdate, admin=Depends(require_admin)):
     return await _get_settings_doc()
 
 
+# ======================== Notifications ========================
+# Live-computed alert feed with a persistent history. Two alert families:
+#   1) "pending_dispatch" — an order is punched and still Pending (goods
+#      ordered but not dispatched). Re-raised DAILY until the order clears.
+#   2) "low_stock" — a raw material / vendor item whose stock_on_hand has
+#      fallen below its admin-set min_stock. Re-raised DAILY while low.
+# Each computed alert is upserted into the `notifications` collection with a
+# stable dedupe key (type:entity:date) so the same day never duplicates but
+# the history is preserved and read/unread state survives.
+
+def _today_bucket() -> str:
+    """IST day bucket (YYYY-MM-DD). Notifications recur once per IST day."""
+    ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    return ist.date().isoformat()
+
+
+class NotificationMarkReadIn(BaseModel):
+    ids: Optional[List[str]] = None   # specific notification ids
+    all: bool = False                 # mark everything read
+
+
+async def _compute_and_store_notifications(user: Dict[str, Any]) -> None:
+    """Compute today's alerts and upsert them into the notifications
+    collection (idempotent per IST day via dedupe_key)."""
+    if is_blank_view(user):
+        return
+    bucket = _today_bucket()
+    ts = now_iso()
+
+    # ---- 1) Pending dispatch reminders (one per still-Pending order) ----
+    pending = await db.orders.find(
+        {"status": "Pending"}, {"_id": 0, "id": 1, "customer_id": 1, "items": 1, "created_at": 1, "order_date": 1}
+    ).to_list(3000)
+    cust_ids = list({o.get("customer_id") for o in pending if o.get("customer_id")})
+    cust_names: Dict[str, str] = {}
+    if cust_ids:
+        async for c in db.customers.find({"id": {"$in": cust_ids}}, {"_id": 0, "id": 1, "name": 1}):
+            cust_names[c["id"]] = c.get("name", "")
+
+    to_upsert: List[Dict[str, Any]] = []
+    for o in pending:
+        item_count = len(o.get("items") or [])
+        if item_count == 0:
+            continue
+        party = cust_names.get(o.get("customer_id") or "", "Unknown party")
+        dedupe = f"pending_dispatch:{o['id']}:{bucket}"
+        to_upsert.append({
+            "dedupe_key": dedupe,
+            "type": "pending_dispatch",
+            "severity": "warning",
+            "entity_id": o["id"],
+            "title": f"Ready to dispatch — {party}",
+            "message": f"{item_count} item(s) ordered and awaiting dispatch. Reminder repeats daily until dispatched.",
+            "date_bucket": bucket,
+        })
+
+    # ---- 2) Low-stock alerts (raw materials / vendor items) ----
+    async for rm in db.raw_materials.find(
+        {"min_stock": {"$gt": 0}},
+        {"_id": 0, "id": 1, "name": 1, "unit": 1, "stock_on_hand": 1, "min_stock": 1},
+    ):
+        stock = float(rm.get("stock_on_hand") or 0)
+        mn = float(rm.get("min_stock") or 0)
+        if mn > 0 and stock < mn:
+            unit = rm.get("unit") or "pcs"
+            dedupe = f"low_stock:{rm['id']}:{bucket}"
+            to_upsert.append({
+                "dedupe_key": dedupe,
+                "type": "low_stock",
+                "severity": "critical",
+                "entity_id": rm["id"],
+                "title": f"Low stock — {rm.get('name', '')}",
+                "message": f"Only {stock:g} {unit} left (minimum {mn:g} {unit}). Please reorder.",
+                "date_bucket": bucket,
+            })
+
+    for n in to_upsert:
+        await db.notifications.update_one(
+            {"dedupe_key": n["dedupe_key"]},
+            {
+                "$setOnInsert": {
+                    "id": str(uuid.uuid4()),
+                    "created_at": ts,
+                    "read": False,
+                    "dedupe_key": n["dedupe_key"],
+                    "type": n["type"],
+                    "entity_id": n["entity_id"],
+                    "date_bucket": n["date_bucket"],
+                },
+                # Keep title/message fresh (stock number may change same day).
+                "$set": {"title": n["title"], "message": n["message"], "severity": n["severity"]},
+            },
+            upsert=True,
+        )
+
+
+@api_router.get("/notifications")
+async def list_notifications(limit: int = 100, user=Depends(get_current_user)):
+    """Return the notification feed (newest first) with the unread count.
+    Recomputes today's live alerts on every call so the feed is current."""
+    if is_blank_view(user):
+        return {"unread_count": 0, "items": []}
+    await _compute_and_store_notifications(user)
+    if limit <= 0 or limit > 500:
+        limit = 100
+    items = await db.notifications.find({}, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    unread = await db.notifications.count_documents({"read": False})
+    return {"unread_count": unread, "items": items}
+
+
+@api_router.get("/notifications/unread-count")
+async def notifications_unread_count(user=Depends(get_current_user)):
+    """Lightweight badge poll — recompute alerts then return unread count."""
+    if is_blank_view(user):
+        return {"unread_count": 0}
+    await _compute_and_store_notifications(user)
+    unread = await db.notifications.count_documents({"read": False})
+    return {"unread_count": unread}
+
+
+@api_router.post("/notifications/mark-read")
+async def notifications_mark_read(body: NotificationMarkReadIn, user=Depends(get_current_user)):
+    ts = now_iso()
+    if body.all:
+        res = await db.notifications.update_many(
+            {"read": False}, {"$set": {"read": True, "read_at": ts}}
+        )
+    elif body.ids:
+        res = await db.notifications.update_many(
+            {"id": {"$in": body.ids}}, {"$set": {"read": True, "read_at": ts}}
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Provide `ids` or set `all` true")
+    unread = await db.notifications.count_documents({"read": False})
+    return {"ok": True, "modified": res.modified_count, "unread_count": unread}
+
+
+
 # ======================== Backup & Restore ========================
 class BackupSettingsUpdate(BaseModel):
     enabled: Optional[bool] = None
@@ -5744,6 +5882,7 @@ class RawMaterialIn(BaseModel):
     unit: Optional[str] = "pcs"          # kg / pcs / litre / m / etc.
     default_rate: float = 0.0            # informational default for purchases
     notes: Optional[str] = ""
+    min_stock: float = 0.0               # low-stock alert threshold (0 = no alert)
 
 
 class RawMaterialUpdate(BaseModel):
@@ -5751,6 +5890,7 @@ class RawMaterialUpdate(BaseModel):
     unit: Optional[str] = None
     default_rate: Optional[float] = None
     notes: Optional[str] = None
+    min_stock: Optional[float] = None
 
 
 @api_router.get("/raw-materials")
@@ -5771,6 +5911,7 @@ async def create_raw_material(body: RawMaterialIn, admin=Depends(require_admin))
         "default_rate": round(float(body.default_rate or 0), 2),
         "notes": (body.notes or "").strip(),
         "stock_on_hand": 0.0,
+        "min_stock": round(float(body.min_stock or 0), 2),
         "created_at": now_iso(),
         "created_by": admin["email"],
     }
@@ -5790,6 +5931,10 @@ async def update_raw_material(rid: str, body: RawMaterialUpdate, admin=Depends(r
         upd["default_rate"] = round(float(body.default_rate), 2)
     if body.notes is not None:
         upd["notes"] = body.notes.strip()
+    if body.min_stock is not None:
+        if body.min_stock < 0:
+            raise HTTPException(status_code=400, detail="min_stock cannot be negative")
+        upd["min_stock"] = round(float(body.min_stock), 2)
     res = await db.raw_materials.update_one({"id": rid}, {"$set": upd})
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Raw material not found")
